@@ -160,6 +160,7 @@ The following afl-fuzz options are supported:
   -t msec       - timeout for each run
   -s            - deliver sample via shared memory
   -D dir        - directory containing DynamoRIO binaries (drrun, drconfig)
+  -b            - use bug bucket for easier crash deduplication
   -w path       - path to winafl.dll
   -e            - expert mode to run WinAFL as a DynamoRIO tool
   -P            - use Intel PT tracing mode

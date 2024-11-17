@@ -122,6 +122,7 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            use_intelpt = 0;           /* Running without DRIO?            */
            custom_dll_defined = 0;    /* Custom DLL path defined ?        */
            persist_dr_cache = 0;      /* Custom DLL path defined ?        */
+           use_bug_bucket = 0;        /* Store dupe crashes separately?   */
            expert_mode = 0;           /* Running in expert mode with DRIO?*/
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -140,6 +141,15 @@ char *client_params;
 char *winafl_dll_path;
 int fuzz_iterations_max = 5000, fuzz_iterations_current;
 DWORD ret_exception_code = 0;
+
+#ifdef _WIN64
+PVOID64 ret_exception_addr = 0;
+PVOID64 bug_bucket[BUG_BUCKET_SIZE] = { 0 };
+#else
+PVOID ret_exception_addr = 0;
+PVOID bug_bucket[BUG_BUCKET_SIZE] = { 0 };
+#endif /* ^_WIN64 */
+int   bug_bucket_count = 0;
 
 CRITICAL_SECTION critical_section;
 u64 watchdog_timeout_time;
@@ -922,6 +932,28 @@ static void read_bitmap(u8* fname) {
 
 }
 
+/* Check the bucket and add the bug if it is not already added. */
+#ifdef _WIN64
+int in_bug_bucket(PVOID64 exception_addr) {
+#else
+int in_bug_bucket(PVOID exception_addr) {
+#endif /* ^_WIN64 */
+    int i;
+    for (i = 0; i < BUG_BUCKET_SIZE; i++) {
+        if (bug_bucket[i] == exception_addr) {
+            return 1;
+        }
+    }
+
+    if (bug_bucket_count == BUG_BUCKET_SIZE) {
+        bug_bucket_count = 0;
+    }
+
+    bug_bucket[bug_bucket_count] = exception_addr;
+    bug_bucket_count++;
+
+    return 0;
+}
 
 /* Check if the current execution path brings anything new to the table.
    Update virgin bits to reflect the finds. Returns 1 if the only change is
@@ -2731,6 +2763,48 @@ DWORD ReadDWORDFromPipe(u32 timeout)
 	return result;
 }
 
+PVOID ReadPVOIDFromPipe(u32 timeout)
+{
+    DWORD num_read;
+    PVOID result = 0;
+
+    if (!is_child_running())
+    {
+        return 0;
+    }
+    if (ReadFile(pipe_handle, &result, sizeof(PVOID), &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
+    {
+        if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
+            CancelIo(pipe_handle);
+            WaitForSingleObject(pipe_overlapped.hEvent, INFINITE);
+            result = 0;
+        }
+    }
+
+    return result;
+}
+
+PVOID64 ReadPVOID64FromPipe(u32 timeout)
+{
+    DWORD num_read;
+    PVOID64 result = 0;
+
+    if (!is_child_running())
+    {
+        return 0;
+    }
+    if (ReadFile(pipe_handle, &result, sizeof(PVOID64), &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
+    {
+        if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
+            CancelIo(pipe_handle);
+            WaitForSingleObject(pipe_overlapped.hEvent, INFINITE);
+            result = 0;
+        }
+    }
+
+    return result;
+}
+
 void WriteCommandToPipe(char cmd)
 {
 	DWORD num_written;
@@ -2914,6 +2988,12 @@ static u8 run_target(char** argv, u32 timeout) {
 
   if (result == 'C') {
 	  ret_exception_code = ReadDWORDFromPipe(timeout);
+#ifdef _WIN64
+      ret_exception_addr = ReadPVOID64FromPipe(timeout);
+#else
+      ret_exception_addr = ReadPVOIDFromPipe(timeout);
+#endif /* ^_WIN64 */
+
 	 // ACTF("destroying target process");
 	  destroy_target_process(2000);
 	  return FAULT_CRASH;
@@ -3742,6 +3822,16 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       snprintf(fn, MAX_PATH, "%s\\crashes\\id_%06llu_%02u_%s", out_dir, unique_crashes,
                         kill_signal, exception_name);
 
+      if (use_bug_bucket) {
+          snprintf(fn, MAX_PATH, "%s\\crashes\\id_%06llu_%p_%s",
+              out_dir, unique_crashes, ret_exception_addr, exception_name);
+
+          if (in_bug_bucket(ret_exception_addr)) {
+              snprintf(fn, MAX_PATH, "%s\\crashes\\bucket\\id_%06llu_%p_%s",
+                  out_dir, unique_crashes, ret_exception_addr, exception_name);
+          }
+      }
+
 #endif /* ^!SIMPLE_FILES */
 
       unique_crashes++;
@@ -4304,6 +4394,11 @@ static void maybe_delete_out_dir(void) {
   /* All right, let's do <out_dir>/crashes/id:* and <out_dir>/hangs/id:*. */
 
   if (!in_place_resume) {
+
+    if (use_bug_bucket) {
+        snprintf(fn, MAX_PATH, "%s\\crashes\\bucket", out_dir);
+        if (delete_files(fn, CASE_PREFIX)) goto dir_cleanup_failed;
+    }
 
     snprintf(fn, MAX_PATH, "%s\\crashes\\README.txt", out_dir);
     unlink(fn); /* Ignore errors */
@@ -7470,6 +7565,7 @@ static void usage(u8* argv0) {
        "  -C            - crash exploration mode (the peruvian rabbit thing)\n"
        "  -e            - expert mode to run WinAFL as a DynamoRIO tool\n"
        "  -l path       - a path to user-defined DLL for custom test cases processing\n"
+       "  -b            - use bug bucket for easier crash deduplication\n"
        "  -V            - show version number and exit\n\n"
 
        "Attach:\n\n"
@@ -7558,6 +7654,9 @@ static void setup_dirs_fds(void) {
   /* All recorded crashes. */
 
   snprintf(tmp, MAX_PATH, "%s\\crashes", out_dir);
+  if (mkdir(tmp)) PFATAL("Unable to create '%s'", tmp);
+
+  snprintf(tmp, MAX_PATH, "%s\\crashes\\bucket", out_dir);
   if (mkdir(tmp)) PFATAL("Unable to create '%s'", tmp);
 
   /* All recorded hangs. */
@@ -8138,7 +8237,7 @@ int main(int argc, char** argv) {
   client_params = NULL;
   winafl_dll_path = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:sdYnCB:S:M:x:QD:b:l:pPc:w:A:eV")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:sdYnCB:S:M:x:QD:bl:pPc:w:A:eV")) > 0)
 
     switch (opt) {
       case 's':
@@ -8174,6 +8273,13 @@ int main(int argc, char** argv) {
         if (dynamorio_dir) FATAL("Multiple -D options not supported");
         dynamorio_dir = optarg;
         break;
+
+      case 'b':
+
+          if (use_bug_bucket) FATAL("Multiple -b options not supported");
+          use_bug_bucket = 1;
+          ACTF("Using bug bucket for easier crash deduplication.");
+          break;
 
       case 'M': { /* master sync ID */
 

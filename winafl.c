@@ -42,6 +42,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <time.h>
 
 #define UNKNOWN_MODULE_ID USHRT_MAX
 
@@ -207,6 +208,17 @@ void WriteDWORDCommandToPipe(DWORD data)
 	WriteFile(pipe, &data, sizeof(DWORD), &num_written, NULL);
 }
 
+void WritePVOIDCommandToPipe(PVOID data)
+{
+    DWORD num_written;
+    WriteFile(pipe, &data, sizeof(PVOID), &num_written, NULL);
+}
+
+void WritePVOID64CommandToPipe(PVOID64 data)
+{
+    DWORD num_written;
+    WriteFile(pipe, &data, sizeof(PVOID64), &num_written, NULL);
+}
 
 static void
 dump_winafl_data()
@@ -216,26 +228,107 @@ dump_winafl_data()
 
 static bool
 onexception(void *drcontext, dr_exception_t *excpt) {
+    time_t ltime;
+    file_t crash_log;
+    module_entry_t* mod_entry;
+
     DWORD exception_code = excpt->record->ExceptionCode;
+#ifdef _WIN64
+    PVOID64 exception_addr = excpt->record->ExceptionAddress;
+#else
+    PVOID exception_addr = excpt->record->ExceptionAddress;
+#endif /* ^_WIN64 */
 
     if(options.debug_mode)
         dr_fprintf(winafl_data.log, "Exception caught: %x\n", exception_code);
 
-    if((exception_code == EXCEPTION_ACCESS_VIOLATION) ||
-       (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
-       (exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
-       (exception_code == EXCEPTION_INT_DIVIDE_BY_ZERO) ||
-       (exception_code == STATUS_HEAP_CORRUPTION) ||
-       (exception_code == EXCEPTION_STACK_OVERFLOW) ||
-       (exception_code == STATUS_STACK_BUFFER_OVERRUN) ||
-       (exception_code == STATUS_FATAL_APP_EXIT)) {
-            if(options.debug_mode) {
-                dr_fprintf(winafl_data.log, "crashed\n");
+    if (&exception_addr != 0x00000000 &&
+        (exception_code == EXCEPTION_ACCESS_VIOLATION) ||
+        (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
+        (exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
+        (exception_code == EXCEPTION_INT_DIVIDE_BY_ZERO) ||
+        (exception_code == STATUS_HEAP_CORRUPTION) ||
+        (exception_code == EXCEPTION_STACK_OVERFLOW) ||
+        (exception_code == STATUS_STACK_BUFFER_OVERRUN) ||
+        (exception_code == STATUS_FATAL_APP_EXIT)) {
+        if (options.debug_mode) {
+            dr_fprintf(winafl_data.log, "crashed\n");
+        } else {
+            time(&ltime);
+            crash_log = dr_open_file("crashes.log", DR_FILE_WRITE_APPEND);
+            dr_fprintf(crash_log, "Crash at time %li\n", ltime);
+
+            mod_entry = module_table_lookup(
+                winafl_data.cache,
+                NUM_THREAD_MODULE_CACHE,
+                module_table,
+                (app_pc)excpt->record->ExceptionAddress
+            );
+
+            if (mod_entry == NULL || mod_entry->data == NULL) {
+#ifdef _WIN64
+                dr_fprintf(
+                    crash_log,
+                    "Exception Address: %016llx / %016llx (unknown module)\n",
+                    ((unsigned __int64)excpt->record->ExceptionAddress),
+                    ((unsigned __int64)excpt->record->ExceptionAddress) - (unsigned __int64)excpt->fault_fragment_info.cache_start_pc
+                );
+#else
+                dr_fprintf(
+                    crash_log,
+                    "Exception Address: %08lx / %08lx (unknown module)\n",
+                    ((uint)excpt->record->ExceptionAddress),
+                    ((uint)excpt->record->ExceptionAddress) - (uint)excpt->fault_fragment_info.cache_start_pc
+                );
+#endif /* ^_WIN64 */
             } else {
-				WriteCommandToPipe('C');
-				WriteDWORDCommandToPipe(exception_code);				
+#ifdef _WIN64
+                dr_fprintf(
+                    crash_log,
+                    "Exception Address: %016llx / %016llx (%s)\n",
+                    ((unsigned __int64)excpt->record->ExceptionAddress),
+                    ((unsigned __int64)excpt->record->ExceptionAddress) - (unsigned __int64)mod_entry->data->start,
+                    dr_module_preferred_name(mod_entry->data)
+                );
+#else
+                dr_fprintf(
+                    crash_log,
+                    "Exception Address: %08lx / %08lx (%s)\n",
+                    ((uint)excpt->record->ExceptionAddress),
+                    ((uint)excpt->record->ExceptionAddress) - (uint)mod_entry->data->start,
+                    dr_module_preferred_name(mod_entry->data)
+                );
+#endif /* ^_WIN64 */
             }
-            dr_exit_process(1);
+
+#ifdef _WIN64
+            dr_fprintf(
+                crash_log,
+                "Exception Information: %016llx %016llx\n",
+                excpt->record->ExceptionInformation[0],
+                excpt->record->ExceptionInformation[1]
+            );
+#else
+            dr_fprintf(
+                crash_log,
+                "Exception Information: %08lx %08lx\n",
+                excpt->record->ExceptionInformation[0],
+                excpt->record->ExceptionInformation[1]
+            );
+#endif /* ^_WIN64 */
+
+            dr_fprintf(crash_log, "\n");
+            dr_close_file(crash_log);
+
+            WriteCommandToPipe('C');
+            WriteDWORDCommandToPipe(exception_code);
+#ifdef _WIN64
+            WritePVOID64CommandToPipe(exception_addr);
+#else
+            WritePVOIDCommandToPipe(exception_addr);
+#endif /* ^_WIN64 */
+        }
+        dr_exit_process(1);
     }
     return true;
 }

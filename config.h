@@ -38,6 +38,10 @@
 /* Default file permission umode when creating files (default: 0600) */
 #define DEFAULT_PERMISSION  0600
 
+/* Default size of bug bucket holding exception addresses: */
+
+#define BUG_BUCKET_SIZE     1000
+
 /* Comment out to disable terminal colors: */
 
 // #define USE_COLOR
